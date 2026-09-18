@@ -13,17 +13,12 @@ Read CONTRACT.md first. It is short and it is the whole ruleset.
 import json
 import sys
 
+
 def decide(sensors, memory):
     """
-    V2.3
-    Autonomous frontier exploration with BFS navigation.
-
-    Strategy:
-    1. Build a persistent map from confirmed movement and sensors.
-    2. Explore locally when an unknown/unvisited edge exists.
-    3. When local exploration is exhausted, use BFS through confirmed
-       open edges to reach another unexplored frontier.
-    4. Learn permanently from collisions.
+    V2.1
+    Persistent map + bidirectional wall memory +
+    collision learning + exploration/backtracking.
     """
 
     # =========================================================
@@ -35,6 +30,8 @@ def decide(sensors, memory):
         memory["heading"] = "N"
 
         memory["visited"] = {(0, 0)}
+        memory["parent"] = {}
+
         memory["walls"] = {}
 
         memory["last_action"] = None
@@ -84,9 +81,6 @@ def decide(sensors, memory):
                 "W": None,
             }
 
-    # =========================================================
-    # CURRENT STATE
-    # =========================================================
     x = memory["x"]
     y = memory["y"]
     heading = memory["heading"]
@@ -105,23 +99,19 @@ def decide(sensors, memory):
     # ---------------------------------------------------------
     if last == "forward":
 
-        # Collision
+        # DEFINITE COLLISION
         if sensors.get("accel_fwd") == -2.0:
 
+            # Remember this exact failed edge
             edge = (current, heading)
-
             memory["collisions"].add(edge)
 
-            # Wall at current cell
+            # Mark wall on current side
             memory["walls"][current][heading] = True
 
-            # Wall at opposite side of neighbor
+            # Mark opposite side on neighboring cell
             dx, dy = delta[heading]
-
-            other = (
-                x + dx,
-                y + dy
-            )
+            other = (x + dx, y + dy)
 
             ensure_cell(other)
 
@@ -143,13 +133,9 @@ def decide(sensors, memory):
                 dx, dy = delta[heading]
 
                 old = (x, y)
+                new = (x + dx, y + dy)
 
-                new = (
-                    x + dx,
-                    y + dy
-                )
-
-                # Confirm open edge
+                # Record successful edge
                 memory["walls"][old][heading] = False
 
                 ensure_cell(new)
@@ -164,8 +150,11 @@ def decide(sensors, memory):
 
                 memory["visited"].add(new)
 
+                if new not in memory["parent"]:
+                    memory["parent"][new] = old
+
     # =========================================================
-    # PROCESS PREVIOUS TURN
+    # PROCESS TURN
     # =========================================================
     if last == "turn_right":
         heading = right_of[heading]
@@ -176,7 +165,7 @@ def decide(sensors, memory):
     memory["heading"] = heading
 
     # =========================================================
-    # PENDING ACTION
+    # EXECUTE PENDING ACTION
     # =========================================================
     if memory["pending"]:
 
@@ -187,11 +176,10 @@ def decide(sensors, memory):
         return action
 
     # =========================================================
-    # REFRESH
+    # REFRESH STATE
     # =========================================================
     x = memory["x"]
     y = memory["y"]
-
     heading = memory["heading"]
 
     current = (x, y)
@@ -207,7 +195,7 @@ def decide(sensors, memory):
     back = opposite[heading]
 
     # =========================================================
-    # SENSOR WALL INFORMATION
+    # DIRECT WALL OBSERVATIONS
     # =========================================================
     if sensors.get("dist_front", 0) == 0:
         memory["walls"][current][front] = True
@@ -219,105 +207,36 @@ def decide(sensors, memory):
         memory["walls"][current][right] = True
 
     # =========================================================
-    # HELPER:
-    # IS THIS EDGE SAFE?
+    # START DEAD-END U-TURN
     # =========================================================
-    def edge_allowed(pos, direction):
+    if current == (0, 0):
 
-        if memory["walls"][pos][direction] is True:
-            return False
+        known = memory["walls"][current]
 
-        if (pos, direction) in memory["collisions"]:
-            return False
+        if (
+            known[front] is True
+            and known[left] is True
+            and known[right] is True
+            and known[back] is None
+        ):
 
-        return True
+            memory["pending"] = [
+                "turn_right",
+                "forward",
+            ]
 
-    # =========================================================
-    # HELPER:
-    # BFS TO FRONTIER
-    # =========================================================
-    def find_frontier_path():
+            action = memory["pending"].pop(0)
 
-        from collections import deque
+            memory["last_action"] = action
 
-        queue = deque([current])
-
-        came_from = {
-            current: None
-        }
-
-        came_direction = {}
-
-        target = None
-
-        while queue:
-
-            pos = queue.popleft()
-
-            # A frontier is a visited cell with an unknown edge.
-            if pos != current:
-
-                cell = memory["walls"][pos]
-
-                unknown_exists = False
-
-                for d in directions:
-
-                    if cell[d] is None:
-                        unknown_exists = True
-                        break
-
-                if unknown_exists:
-
-                    target = pos
-                    break
-
-            # Expand only through CONFIRMED open edges.
-            cell = memory["walls"][pos]
-
-            for direction in directions:
-
-                if cell[direction] is not False:
-                    continue
-
-                dx, dy = delta[direction]
-
-                nxt = (
-                    pos[0] + dx,
-                    pos[1] + dy
-                )
-
-                if nxt in came_from:
-                    continue
-
-                came_from[nxt] = pos
-                came_direction[nxt] = direction
-
-                queue.append(nxt)
-
-        if target is None:
-            return None
-
-        # Reconstruct path.
-        path = []
-
-        node = target
-
-        while node != current:
-
-            path.append(
-                came_direction[node]
-            )
-
-            node = came_from[node]
-
-        path.reverse()
-
-        return path
+            return action
 
     # =========================================================
-    # LOCAL EXPLORATION
+    # BUILD CANDIDATES
     # =========================================================
+    candidates = []
+
+    # Right → Front → Left → Back
     preferred = [
         right,
         front,
@@ -325,120 +244,75 @@ def decide(sensors, memory):
         back,
     ]
 
-    # ---------------------------------------------------------
-    # FIRST: UNVISITED SAFE CELL
-    # ---------------------------------------------------------
-    selected = None
-
     for direction in preferred:
 
-        if not edge_allowed(
-            current,
-            direction
-        ):
+        # Known wall
+        if memory["walls"][current][direction] is True:
+            continue
+
+        # Previously collided with this edge
+        if (current, direction) in memory["collisions"]:
             continue
 
         dx, dy = delta[direction]
 
-        nxt = (
-            x + dx,
-            y + dy
-        )
+        nxt = (x + dx, y + dy)
+
+        candidates.append((direction, nxt))
+
+    # =========================================================
+    # PRIORITY 1: UNVISITED
+    # =========================================================
+    selected = None
+
+    for direction, nxt in candidates:
 
         if nxt not in memory["visited"]:
-
-            selected = (
-                direction,
-                nxt
-            )
-
+            selected = (direction, nxt)
             break
 
-    # ---------------------------------------------------------
-    # SECOND: UNKNOWN EDGE
-    # ---------------------------------------------------------
+    # =========================================================
+    # PRIORITY 2: UNKNOWN
+    # =========================================================
     if selected is None:
 
-        for direction in preferred:
-
-            if not edge_allowed(
-                current,
-                direction
-            ):
-                continue
+        for direction, nxt in candidates:
 
             if memory["walls"][current][direction] is None:
-
-                dx, dy = delta[direction]
-
-                nxt = (
-                    x + dx,
-                    y + dy
-                )
-
-                selected = (
-                    direction,
-                    nxt
-                )
-
+                selected = (direction, nxt)
                 break
 
     # =========================================================
-    # GLOBAL BFS
+    # PRIORITY 3: BACKTRACK
+    # =========================================================
+    if selected is None and current in memory["parent"]:
+
+        parent = memory["parent"][current]
+
+        px, py = parent
+
+        dx = px - x
+        dy = py - y
+
+        if dx == 1:
+            back_direction = "E"
+
+        elif dx == -1:
+            back_direction = "W"
+
+        elif dy == 1:
+            back_direction = "S"
+
+        else:
+            back_direction = "N"
+
+        selected = (back_direction, parent)
+
+    # =========================================================
+    # NO MOVE
     # =========================================================
     if selected is None:
 
-        path = find_frontier_path()
-
-        if path:
-
-            direction = path[0]
-
-            dx, dy = delta[direction]
-
-            nxt = (
-                x + dx,
-                y + dy
-            )
-
-            selected = (
-                direction,
-                nxt
-            )
-
-    # =========================================================
-    # FALLBACK:
-    # ANY SAFE KNOWN OPEN EDGE
-    # =========================================================
-    if selected is None:
-
-        for direction in preferred:
-
-            if memory["walls"][current][direction] is False:
-
-                if (current, direction) in memory["collisions"]:
-                    continue
-
-                dx, dy = delta[direction]
-
-                nxt = (
-                    x + dx,
-                    y + dy
-                )
-
-                selected = (
-                    direction,
-                    nxt
-                )
-
-                break
-
-    # =========================================================
-    # NOTHING FOUND
-    # =========================================================
-    if selected is None:
-
-        # Special start handling.
         if current == (0, 0):
 
             memory["pending"] = [
@@ -457,44 +331,29 @@ def decide(sensors, memory):
         return "wait"
 
     # =========================================================
-    # FACE TARGET
+    # TURN TOWARD TARGET
     # =========================================================
     target_direction = selected[0]
 
-    # ---------------------------------------------------------
-    # FORWARD
-    # ---------------------------------------------------------
     if target_direction == heading:
 
         action = "forward"
 
-    # ---------------------------------------------------------
-    # RIGHT
-    # ---------------------------------------------------------
     elif target_direction == right_of[heading]:
 
-        memory["pending"] = [
-            "forward"
-        ]
+        memory["pending"] = ["forward"]
 
         action = "turn_right"
 
-    # ---------------------------------------------------------
-    # LEFT
-    # ---------------------------------------------------------
     elif target_direction == left_of[heading]:
 
-        memory["pending"] = [
-            "forward"
-        ]
+        memory["pending"] = ["forward"]
 
         action = "turn_left"
 
-    # ---------------------------------------------------------
-    # BACK
-    # ---------------------------------------------------------
     else:
 
+        # 180 degree turn
         memory["pending"] = [
             "turn_right",
             "forward",
@@ -505,6 +364,7 @@ def decide(sensors, memory):
     memory["last_action"] = action
 
     return action
+
 
 # =============================================================================
 # DO NOT EDIT BELOW THIS LINE
