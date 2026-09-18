@@ -16,18 +16,14 @@ import sys
 
 def decide(sensors, memory):
     """
-    V2.0
-    - Tracks position and heading
-    - Builds a persistent local map
-    - Remembers walls
-    - Learns from collisions
-    - Explores unvisited cells
-    - Backtracks when necessary
+    V2.1
+    Persistent map + bidirectional wall memory +
+    collision learning + exploration/backtracking.
     """
 
-    # ---------------------------------------------------------
-    # INITIALISE MEMORY
-    # ---------------------------------------------------------
+    # =========================================================
+    # INITIALIZATION
+    # =========================================================
     if "x" not in memory:
         memory["x"] = 0
         memory["y"] = 0
@@ -36,21 +32,13 @@ def decide(sensors, memory):
         memory["visited"] = {(0, 0)}
         memory["parent"] = {}
 
-        # walls[(x, y)] = {"N": None, "E": None, "S": None, "W": None}
         memory["walls"] = {}
 
         memory["last_action"] = None
         memory["pending"] = []
 
-    x = memory["x"]
-    y = memory["y"]
-    heading = memory["heading"]
+        memory["collisions"] = set()
 
-    current = (x, y)
-
-    # ---------------------------------------------------------
-    # HELPERS
-    # ---------------------------------------------------------
     directions = ["N", "E", "S", "W"]
 
     delta = {
@@ -81,44 +69,56 @@ def decide(sensors, memory):
         "W": "E",
     }
 
-    # ---------------------------------------------------------
-    # CREATE MAP ENTRY
-    # ---------------------------------------------------------
-    if current not in memory["walls"]:
-        memory["walls"][current] = {
-            "N": None,
-            "E": None,
-            "S": None,
-            "W": None,
-        }
+    # =========================================================
+    # MAP HELPER
+    # =========================================================
+    def ensure_cell(pos):
+        if pos not in memory["walls"]:
+            memory["walls"][pos] = {
+                "N": None,
+                "E": None,
+                "S": None,
+                "W": None,
+            }
 
-    # ---------------------------------------------------------
-    # PROCESS RESULT OF PREVIOUS ACTION
-    # ---------------------------------------------------------
+    x = memory["x"]
+    y = memory["y"]
+    heading = memory["heading"]
+
+    current = (x, y)
+
+    ensure_cell(current)
+
+    # =========================================================
+    # PROCESS PREVIOUS ACTION
+    # =========================================================
     last = memory.get("last_action")
 
+    # ---------------------------------------------------------
+    # PREVIOUS FORWARD
+    # ---------------------------------------------------------
     if last == "forward":
 
-        # Collision = definite wall
+        # DEFINITE COLLISION
         if sensors.get("accel_fwd") == -2.0:
+
+            # Remember this exact failed edge
+            edge = (current, heading)
+            memory["collisions"].add(edge)
+
+            # Mark wall on current side
             memory["walls"][current][heading] = True
 
-            # Also remember wall from the other side
+            # Mark opposite side on neighboring cell
             dx, dy = delta[heading]
             other = (x + dx, y + dy)
 
-            if other not in memory["walls"]:
-                memory["walls"][other] = {
-                    "N": None,
-                    "E": None,
-                    "S": None,
-                    "W": None,
-                }
+            ensure_cell(other)
 
             memory["walls"][other][opposite[heading]] = True
 
         else:
-            # Check whether forward actually moved.
+
             rpm_l = sensors.get("rpm_left", 0)
             rpm_r = sensors.get("rpm_right", 0)
 
@@ -129,32 +129,33 @@ def decide(sensors, memory):
             )
 
             if moved:
+
                 dx, dy = delta[heading]
 
                 old = (x, y)
                 new = (x + dx, y + dy)
 
+                # Record successful edge
+                memory["walls"][old][heading] = False
+
+                ensure_cell(new)
+
+                memory["walls"][new][opposite[heading]] = False
+
+                # Update position
                 memory["x"] = new[0]
                 memory["y"] = new[1]
+
+                current = new
 
                 memory["visited"].add(new)
 
                 if new not in memory["parent"]:
                     memory["parent"][new] = old
 
-                current = new
-
-                if current not in memory["walls"]:
-                    memory["walls"][current] = {
-                        "N": None,
-                        "E": None,
-                        "S": None,
-                        "W": None,
-                    }
-
-    # ---------------------------------------------------------
+    # =========================================================
     # PROCESS TURN
-    # ---------------------------------------------------------
+    # =========================================================
     if last == "turn_right":
         heading = right_of[heading]
 
@@ -163,45 +164,39 @@ def decide(sensors, memory):
 
     memory["heading"] = heading
 
-    # ---------------------------------------------------------
-    # IF A PREVIOUSLY PLANNED ACTION EXISTS
-    # ---------------------------------------------------------
+    # =========================================================
+    # EXECUTE PENDING ACTION
+    # =========================================================
     if memory["pending"]:
+
         action = memory["pending"].pop(0)
+
         memory["last_action"] = action
+
         return action
 
-    # ---------------------------------------------------------
-    # CURRENT CELL AFTER MOVEMENT / TURN
-    # ---------------------------------------------------------
+    # =========================================================
+    # REFRESH STATE
+    # =========================================================
     x = memory["x"]
     y = memory["y"]
     heading = memory["heading"]
+
     current = (x, y)
 
-    if current not in memory["walls"]:
-        memory["walls"][current] = {
-            "N": None,
-            "E": None,
-            "S": None,
-            "W": None,
-        }
+    ensure_cell(current)
 
-    # ---------------------------------------------------------
-    # CONVERT SENSOR DIRECTIONS
-    # ---------------------------------------------------------
+    # =========================================================
+    # SENSOR DIRECTIONS
+    # =========================================================
     front = heading
     left = left_of[heading]
     right = right_of[heading]
+    back = opposite[heading]
 
-    # Sensor observations.
-    #
-    # 0 means definitely blocked.
-    # >0 means potentially open.
-    #
-    # We only permanently trust a collision as a wall because
-    # the contract allows noisy distance readings.
-
+    # =========================================================
+    # DIRECT WALL OBSERVATIONS
+    # =========================================================
     if sensors.get("dist_front", 0) == 0:
         memory["walls"][current][front] = True
 
@@ -211,9 +206,9 @@ def decide(sensors, memory):
     if sensors.get("dist_right", 0) == 0:
         memory["walls"][current][right] = True
 
-    # ---------------------------------------------------------
-    # INITIAL START DEAD-END / U-TURN
-    # ---------------------------------------------------------
+    # =========================================================
+    # START DEAD-END U-TURN
+    # =========================================================
     if current == (0, 0):
 
         known = memory["walls"][current]
@@ -222,64 +217,76 @@ def decide(sensors, memory):
             known[front] is True
             and known[left] is True
             and known[right] is True
-            and known[opposite[heading]] is None
+            and known[back] is None
         ):
+
             memory["pending"] = [
                 "turn_right",
                 "forward",
             ]
 
             action = memory["pending"].pop(0)
+
             memory["last_action"] = action
+
             return action
 
-    # ---------------------------------------------------------
-    # BUILD AVAILABLE DIRECTIONS
-    # ---------------------------------------------------------
-    options = []
+    # =========================================================
+    # BUILD CANDIDATES
+    # =========================================================
+    candidates = []
 
-    # Prefer right, then front, then left, then backward.
+    # Right → Front → Left → Back
     preferred = [
         right,
         front,
         left,
-        opposite[heading],
+        back,
     ]
 
     for direction in preferred:
 
-        # Known wall → don't use it.
+        # Known wall
         if memory["walls"][current][direction] is True:
             continue
 
+        # Previously collided with this edge
+        if (current, direction) in memory["collisions"]:
+            continue
+
         dx, dy = delta[direction]
+
         nxt = (x + dx, y + dy)
 
-        options.append((direction, nxt))
+        candidates.append((direction, nxt))
 
-    # ---------------------------------------------------------
-    # FIRST PRIORITY: UNVISITED CELL
-    # ---------------------------------------------------------
+    # =========================================================
+    # PRIORITY 1: UNVISITED
+    # =========================================================
     selected = None
 
-    for direction, nxt in options:
+    for direction, nxt in candidates:
+
         if nxt not in memory["visited"]:
             selected = (direction, nxt)
             break
 
-    # ---------------------------------------------------------
-    # SECOND PRIORITY: ANY UNKNOWN PATH
-    # ---------------------------------------------------------
+    # =========================================================
+    # PRIORITY 2: UNKNOWN
+    # =========================================================
     if selected is None:
-        for direction, nxt in options:
+
+        for direction, nxt in candidates:
+
             if memory["walls"][current][direction] is None:
                 selected = (direction, nxt)
                 break
 
-    # ---------------------------------------------------------
-    # THIRD PRIORITY: BACKTRACK
-    # ---------------------------------------------------------
+    # =========================================================
+    # PRIORITY 3: BACKTRACK
+    # =========================================================
     if selected is None and current in memory["parent"]:
+
         parent = memory["parent"][current]
 
         px, py = parent
@@ -289,37 +296,43 @@ def decide(sensors, memory):
 
         if dx == 1:
             back_direction = "E"
+
         elif dx == -1:
             back_direction = "W"
+
         elif dy == 1:
             back_direction = "S"
+
         else:
             back_direction = "N"
 
         selected = (back_direction, parent)
 
-    # ---------------------------------------------------------
-    # NO KNOWN MOVE
-    # ---------------------------------------------------------
+    # =========================================================
+    # NO MOVE
+    # =========================================================
     if selected is None:
 
-        # At the starting point, force exploration backward
         if current == (0, 0):
+
             memory["pending"] = [
                 "turn_right",
                 "forward",
             ]
 
             action = memory["pending"].pop(0)
+
             memory["last_action"] = action
+
             return action
 
         memory["last_action"] = "wait"
+
         return "wait"
 
-    # ---------------------------------------------------------
-    # DETERMINE HOW TO TURN TOWARD TARGET
-    # ---------------------------------------------------------
+    # =========================================================
+    # TURN TOWARD TARGET
+    # =========================================================
     target_direction = selected[0]
 
     if target_direction == heading:
@@ -329,22 +342,27 @@ def decide(sensors, memory):
     elif target_direction == right_of[heading]:
 
         memory["pending"] = ["forward"]
+
         action = "turn_right"
 
     elif target_direction == left_of[heading]:
 
         memory["pending"] = ["forward"]
+
         action = "turn_left"
 
     else:
-        # 180-degree turn
+
+        # 180 degree turn
         memory["pending"] = [
             "turn_right",
             "forward",
         ]
+
         action = "turn_right"
 
     memory["last_action"] = action
+
     return action
 
 
